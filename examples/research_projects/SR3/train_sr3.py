@@ -17,7 +17,8 @@ import diffusers
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from datasets import load_dataset
-from diffusers import DDPMPipeline, DDPMScheduler, UNet2DModel
+from diffusers import DDPMPipeline, DDPMScheduler
+from super_res_models import SuperResUNet
 from diffusers.optimization import get_scheduler
 from diffusers.training_utils import EMAModel
 from diffusers.utils import check_min_version
@@ -98,15 +99,6 @@ def parse_args():
         type=str,
         default=None,
         help="The directory where the downloaded models and datasets will be stored.",
-    )
-    parser.add_argument(
-        "--resolution",
-        type=int,
-        default=64,
-        help=(
-            "The resolution for input images, all the images in the train/validation dataset will be resized to this"
-            " resolution"
-        ),
     )
     parser.add_argument(
         "--train_batch_size", type=int, default=16, help="Batch size (per device) for the training dataloader."
@@ -236,6 +228,10 @@ def parse_args():
         ),
     )
 
+    parser.add_argument("--high_res_shape", type=int, help="The size of the high resolution image.")
+    parser.add_argument("--low_res_shape", type=int, help="The size of the low resolution image.")
+
+
     args = parser.parse_args()
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
     if env_local_rank != -1 and env_local_rank != args.local_rank:
@@ -249,21 +245,14 @@ def parse_args():
 
 def visualize_image(image: torch.Tensor):
     # Image is of shape 3,64,64 (RGB)
-    # We need to convert it to 64,64,3 (RGB)
     image = image.permute(1, 2, 0)
-    # Convert to numpy
     image = image.cpu().numpy()
-
     min_val = image.min()
     max_val = image.max()
 
     # Make sure that the image is between 0 and 1, account for negative values
     image = (image - min_val) / (max_val - min_val)
-
-    # save image as pillow image
     image = Image.fromarray((image * 255).astype(np.uint8))
-
-    # save image as png
     image.save("image.png")
 
 def get_full_repo_name(model_id: str, organization: Optional[str] = None, token: Optional[str] = None):
@@ -319,8 +308,8 @@ def main(args):
             os.makedirs(args.output_dir, exist_ok=True)
 
     # Initialize the model
-    model = UNet2DModel(
-        sample_size=args.resolution,
+    model = SuperResUNet(
+        sample_size=args.high_res_shape,
         in_channels=3,
         out_channels=3,
         layers_per_block=2,
@@ -390,22 +379,30 @@ def main(args):
         # See more about loading custom images at
         # https://huggingface.co/docs/datasets/v2.4.0/en/image_load#imagefolder
 
-    
-
     # Preprocessing the datasets and DataLoaders creation.
-    augmentations = Compose(
+    high_res_augmentations = Compose(
         [
-            Resize(args.resolution, interpolation=InterpolationMode.BILINEAR),
-            CenterCrop(args.resolution),
-            RandomHorizontalFlip(),
+            CenterCrop(args.high_res_shape),
             ToTensor(),
-            Normalize([0.5], [0.5]),
         ]
     )
 
-    def transforms(examples):
-        images = [augmentations(image.convert("RGB")) for image in examples["image"]]
-        return {"input": images}
+    def transforms(data_loader_item):
+        # Make sure that all samples are bigger than the high resolution shape
+        assert len(data_loader_item["image"]) == 1, (
+            f"Found {len(data_loader_item['image'])} images in the same sample, but only one is supported."
+        )
+        image = data_loader_item["image"][0]
+        assert image.size[0] >= args.high_res_shape and image.size[1] >= args.high_res_shape, (
+            f"Image size {image.size} is smaller than the high resolution shape {args.high_res_shape}"
+        )
+
+        high_res_image = high_res_augmentations(image.convert("RGB")).unsqueeze(0)
+        low_res_image = F.interpolate(high_res_image, size=args.low_res_shape, mode="area")
+        return {
+            "high_res_image": high_res_image,
+            "low_res_image": low_res_image
+        }
 
     logger.info(f"Dataset size: {len(dataset)}")
 
@@ -490,37 +487,34 @@ def main(args):
                 continue
 
             
-            clean_images = batch["input"]
+            high_res_images = batch["high_res_image"]
+            low_res_images = batch["low_res_image"]
             # Sample noise that we'll add to the images
-            noise = torch.randn(clean_images.shape).to(clean_images.device)
+            noise = torch.randn(high_res_images.shape).to(high_res_images.device)
           
-            bsz = clean_images.shape[0]
+            batch_size = high_res_images.shape[0]
             # Sample a random timestep for each image
             timesteps = torch.randint(
-                0, noise_scheduler.config.num_train_timesteps, (bsz,), device=clean_images.device
+                0, noise_scheduler.config.num_train_timesteps, (batch_size,), device=high_res_images.device
             ).long()
-
-            index_of_min_time = torch.argmin(timesteps)
 
             # Add noise to the clean images according to the noise magnitude at each timestep
             # (this is the forward diffusion process)
-            noisy_images = noise_scheduler.add_noise(clean_images, noise, timesteps)
-            visualize_image(clean_images[index_of_min_time])
-            visualize_image(noisy_images[index_of_min_time])
+            noisy_high_res_images = noise_scheduler.add_noise(high_res_images, noise, timesteps)
 
             with accelerator.accumulate(model):
                 # Predict the noise residual
-                model_output = model(noisy_images, timesteps).sample
+                model_output = model(noisy_high_res_images, timesteps, low_res=low_res_images).sample
 
                 if args.prediction_type == "epsilon":
                     loss = F.mse_loss(model_output, noise)  # this could have different weights!
                 elif args.prediction_type == "sample":
                     alpha_t = _extract_into_tensor(
-                        noise_scheduler.alphas_cumprod, timesteps, (clean_images.shape[0], 1, 1, 1)
+                        noise_scheduler.alphas_cumprod, timesteps, (noisy_high_res_images.shape[0], 1, 1, 1)
                     )
                     snr_weights = alpha_t / (1 - alpha_t)
                     loss = snr_weights * F.mse_loss(
-                        model_output, clean_images, reduction="none"
+                        model_output, high_res_images, reduction="none"
                     )  # use SNR weighting from distillation paper
                     loss = loss.mean()
                 else:
