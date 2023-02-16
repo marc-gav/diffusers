@@ -4,7 +4,7 @@ import logging
 import math
 import os
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 from matplotlib import pyplot as plt
 import numpy as np
@@ -17,8 +17,8 @@ import diffusers
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from datasets import load_dataset
-from diffusers import DDPMPipeline, DDPMScheduler
-from super_res_models import SuperResUNet
+from diffusers import DDPMScheduler, DDPMPipeline
+
 from diffusers.optimization import get_scheduler
 from diffusers.training_utils import EMAModel
 from diffusers.utils import check_min_version
@@ -26,14 +26,13 @@ from huggingface_hub import HfFolder, Repository, create_repo, whoami
 from torchvision.transforms import (
     CenterCrop,
     Compose,
-    InterpolationMode,
-    Normalize,
-    RandomHorizontalFlip,
-    Resize,
     ToTensor,
 )
 from tqdm.auto import tqdm
 
+from super_res_models import SuperResUNet
+from sr3_pipeline import SR3Pipeline
+import wandb
 
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
 # check_min_version("0.13.0.dev0")
@@ -59,7 +58,7 @@ def _extract_into_tensor(arr, timesteps, broadcast_shape):
     return res.expand(broadcast_shape)
 
 
-def parse_args():
+def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Simple example of a training script.")
     parser.add_argument(
         "--dataset_name",
@@ -172,7 +171,7 @@ def parse_args():
     parser.add_argument(
         "--logger",
         type=str,
-        default="tensorboard",
+        default="wandb",
         choices=["tensorboard", "wandb"],
         help=(
             "Whether to use [tensorboard](https://www.tensorflow.org/tensorboard) or [wandb](https://www.wandb.ai)"
@@ -230,7 +229,7 @@ def parse_args():
 
     parser.add_argument("--high_res_shape", type=int, help="The size of the high resolution image.")
     parser.add_argument("--low_res_shape", type=int, help="The size of the low resolution image.")
-
+    parser.add_argument("--run_name", type=str, help="The name of the run.")
 
     args = parser.parse_args()
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
@@ -242,8 +241,13 @@ def parse_args():
 
     return args
 
+def log_args_wandb(args: argparse.Namespace):
+    run = wandb.init(project="sr3_HF_Diffusers", config=args, name = args.run_name)
+    wandb.config.update(args)
+    return run
 
-def visualize_image(image: torch.Tensor):
+
+def convert_to_pillow(image: torch.Tensor) -> Image:
     # Image is of shape 3,64,64 (RGB)
     image = image.permute(1, 2, 0)
     image = image.cpu().numpy()
@@ -253,7 +257,7 @@ def visualize_image(image: torch.Tensor):
     # Make sure that the image is between 0 and 1, account for negative values
     image = (image - min_val) / (max_val - min_val)
     image = Image.fromarray((image * 255).astype(np.uint8))
-    image.save("image.png")
+    return image
 
 def get_full_repo_name(model_id: str, organization: Optional[str] = None, token: Optional[str] = None):
     if token is None:
@@ -264,32 +268,10 @@ def get_full_repo_name(model_id: str, organization: Optional[str] = None, token:
     else:
         return f"{organization}/{model_id}"
 
-
-def main(args):
-    logging_dir = os.path.join(args.output_dir, args.logging_dir)
-
-    accelerator = Accelerator(
-        gradient_accumulation_steps=args.gradient_accumulation_steps,
-        mixed_precision=args.mixed_precision,
-        log_with=args.logger,
-        logging_dir=logging_dir,
-    )
-
-    # Make one log on every process with the configuration for debugging.
-    logging.basicConfig(
-        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
-        datefmt="%m/%d/%Y %H:%M:%S",
-        level=logging.INFO,
-    )
-    logger.info(accelerator.state, main_process_only=False)
-    if accelerator.is_local_main_process:
-        datasets.utils.logging.set_verbosity_warning()
-        diffusers.utils.logging.set_verbosity_info()
-    else:
         datasets.utils.logging.set_verbosity_error()
         diffusers.utils.logging.set_verbosity_error()
 
-    # Handle the repository creation
+def handle_repo_creation(accelerator: Accelerator, args: argparse.Namespace) -> Optional[Repository]:
     if accelerator.is_main_process:
         if args.push_to_hub:
             if args.hub_model_id is None:
@@ -304,8 +286,76 @@ def main(args):
                     gitignore.write("step_*\n")
                 if "epoch_*" not in gitignore:
                     gitignore.write("epoch_*\n")
+            
+            return repo
+
         elif args.output_dir is not None:
             os.makedirs(args.output_dir, exist_ok=True)
+
+def log_on_every_process(accelerator: Accelerator) -> None:
+    logging.basicConfig(
+        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+        datefmt="%m/%d/%Y %H:%M:%S",
+        level=logging.INFO,
+    )
+    logger.info(accelerator.state, main_process_only=False)
+    if accelerator.is_local_main_process:
+        datasets.utils.logging.set_verbosity_warning()
+        diffusers.utils.logging.set_verbosity_info()
+    else:
+        datasets.utils.logging.set_verbosity_error()
+        diffusers.utils.logging.set_verbosity_error()
+
+def get_train_val_split(args: argparse.Namespace):
+    if args.dataset_name is not None:
+        train_dataset = load_dataset(
+            args.dataset_name,
+            args.dataset_config_name,
+            cache_dir=args.cache_dir,
+            split="train[:90%]",
+        )
+        val_dataset = load_dataset(
+        args.dataset_name,
+        args.dataset_config_name,
+        cache_dir=args.cache_dir,
+        split="train[-2:-1]",
+    )
+    else:
+        dataset = load_dataset("imagefolder", data_dir=args.train_data_dir, cache_dir=args.cache_dir, split="train")
+        train_dataset, val_dataset = dataset.train_test_split(train_size=0.1, test_size=0.01, shuffle=True)
+        # See more about loading custom images at
+        # https://huggingface.co/docs/datasets/v2.4.0/en/image_load#imagefolder
+    
+    return train_dataset, val_dataset
+
+def initialize_noise_scheduler(args: argparse.Namespace):
+    accepts_prediction_type = "prediction_type" in set(inspect.signature(DDPMScheduler.__init__).parameters.keys())
+    if accepts_prediction_type:
+        return DDPMScheduler(
+            num_train_timesteps=args.ddpm_num_steps,
+            beta_schedule=args.ddpm_beta_schedule,
+            prediction_type=args.prediction_type,
+        )
+    else:
+        return DDPMScheduler(num_train_timesteps=args.ddpm_num_steps, beta_schedule=args.ddpm_beta_schedule)
+
+
+def main(args):
+    logging_dir = os.path.join(args.output_dir, args.logging_dir)
+
+    accelerator = Accelerator(
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        mixed_precision=args.mixed_precision,
+        log_with=args.logger,
+        logging_dir=logging_dir,
+    )
+
+    log_on_every_process(accelerator)
+    handle_repo_creation(accelerator, args)
+
+    # Log all the arguments to wandb
+    if accelerator.is_main_process:
+        wandb_run = log_args_wandb(args)
 
     # Initialize the model
     model = SuperResUNet(
@@ -342,18 +392,7 @@ def main(args):
             power=args.ema_power,
         )
 
-    # Initialize the scheduler
-    accepts_prediction_type = "prediction_type" in set(inspect.signature(DDPMScheduler.__init__).parameters.keys())
-    if accepts_prediction_type:
-        noise_scheduler = DDPMScheduler(
-            num_train_timesteps=args.ddpm_num_steps,
-            beta_schedule=args.ddpm_beta_schedule,
-            prediction_type=args.prediction_type,
-        )
-    else:
-        noise_scheduler = DDPMScheduler(num_train_timesteps=args.ddpm_num_steps, beta_schedule=args.ddpm_beta_schedule)
-
-    # Initialize the optimizer
+    noise_scheduler = initialize_noise_scheduler(args)
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=args.learning_rate,
@@ -362,24 +401,10 @@ def main(args):
         eps=args.adam_epsilon,
     )
 
-    # Get the datasets: you can either provide your own training and evaluation files (see below)
-    # or specify a Dataset from the hub (the dataset will be downloaded automatically from the datasets Hub).
+    train_dataset, val_dataset = get_train_val_split(args)
+    logger.info(f"Training Dataset size: {len(train_dataset)}")
+    logger.info(f"Test Dataset size: {len(val_dataset)}")
 
-    # In distributed training, the load_dataset function guarantees that only one local process can concurrently
-    # download the dataset.
-    if args.dataset_name is not None:
-        dataset = load_dataset(
-            args.dataset_name,
-            args.dataset_config_name,
-            cache_dir=args.cache_dir,
-            split="train",
-        )
-    else:
-        dataset = load_dataset("imagefolder", data_dir=args.train_data_dir, cache_dir=args.cache_dir, split="train")
-        # See more about loading custom images at
-        # https://huggingface.co/docs/datasets/v2.4.0/en/image_load#imagefolder
-
-    # Preprocessing the datasets and DataLoaders creation.
     high_res_augmentations = Compose(
         [
             CenterCrop(args.high_res_shape),
@@ -404,14 +429,18 @@ def main(args):
             "low_res_image": low_res_image
         }
 
-    logger.info(f"Dataset size: {len(dataset)}")
+    # Apply the transforms to the datasets
+    train_dataset.set_transform(transforms)
+    val_dataset.set_transform(transforms)
 
-    dataset.set_transform(transforms)
+    # Create the DataLoaders for the training and val sets
     train_dataloader = torch.utils.data.DataLoader(
-        dataset, batch_size=args.train_batch_size, shuffle=True, num_workers=args.dataloader_num_workers
+        train_dataset, batch_size=args.train_batch_size, shuffle=True, num_workers=args.dataloader_num_workers
+    )
+    val_dataloader = torch.utils.data.DataLoader(
+        val_dataset, batch_size=args.eval_batch_size, shuffle=False, num_workers=args.dataloader_num_workers
     )
 
-    # Initialize the learning rate scheduler
     lr_scheduler = get_scheduler(
         args.lr_scheduler,
         optimizer=optimizer,
@@ -419,9 +448,8 @@ def main(args):
         num_training_steps=(len(train_dataloader) * args.num_epochs),
     )
 
-    # Prepare everything with our `accelerator`.
-    model, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-        model, optimizer, train_dataloader, lr_scheduler
+    model, optimizer, train_dataloader, val_dataloader,lr_scheduler = accelerator.prepare(
+        model, optimizer, train_dataloader,val_dataloader, lr_scheduler
     )
 
     if args.use_ema:
@@ -439,7 +467,8 @@ def main(args):
     max_train_steps = args.num_epochs * num_update_steps_per_epoch
 
     logger.info("***** Running training *****")
-    logger.info(f"  Num examples = {len(dataset)}")
+    logger.info(f"  Num of training samples = {len(train_dataset)}")
+    logger.info(f"  Num of validation samples = {len(val_dataset)}")    
     logger.info(f"  Num Epochs = {args.num_epochs}")
     logger.info(f"  Instantaneous batch size per device = {args.train_batch_size}")
     logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
@@ -485,10 +514,11 @@ def main(args):
                 if step % args.gradient_accumulation_steps == 0:
                     progress_bar.update(1)
                 continue
-
             
             high_res_images = batch["high_res_image"]
             low_res_images = batch["low_res_image"]
+
+            
             # Sample noise that we'll add to the images
             noise = torch.randn(high_res_images.shape).to(high_res_images.device)
           
@@ -552,36 +582,51 @@ def main(args):
 
         # Generate sample images for visual inspection
         if accelerator.is_main_process:
-            if epoch % args.save_images_epochs == 0 or epoch == args.num_epochs - 1:
-                unet = accelerator.unwrap_model(model)
-                if args.use_ema:
-                    ema_model.copy_to(unet.parameters())
-                pipeline = DDPMPipeline(
-                    unet=unet,
-                    scheduler=noise_scheduler,
-                )
-
-                generator = torch.Generator(device=pipeline.device).manual_seed(0)
-                # run pipeline in inference (sample random noise and denoise)
-                images = pipeline(
-                    generator=generator,
-                    batch_size=args.eval_batch_size,
-                    output_type="numpy",
-                ).images
-
-                # denormalize the images and save to tensorboard
-                images_processed = (images * 255).round().astype("uint8")
-
-                if args.logger == "tensorboard":
-                    accelerator.get_tracker("tensorboard").add_images(
-                        "test_samples", images_processed.transpose(0, 3, 1, 2), epoch
+            if epoch == args.num_epochs - 1: # last epoch
+                for val_step, val_batch in enumerate(val_dataloader):
+                    unet = accelerator.unwrap_model(model)
+                    if args.use_ema:
+                        ema_model.copy_to(unet.parameters())
+                    pipeline = SR3Pipeline(
+                        unet=unet,
+                        scheduler=noise_scheduler,
                     )
 
-            if epoch % args.save_model_epochs == 0 or epoch == args.num_epochs - 1:
-                # save the model
-                pipeline.save_pretrained(args.output_dir)
-                if args.push_to_hub:
-                    repo.push_to_hub(commit_message=f"Epoch {epoch}", blocking=False)
+                    generator = torch.Generator(device=pipeline.device).manual_seed(0)
+                    # run pipeline in inference (sample random noise and denoise)
+                    condition_image_batch = val_batch["low_res_image"]
+                    ground_truth_batch = val_batch["high_res_image"]
+                    images = pipeline(
+                        condition_image_batch=condition_image_batch,
+                        generator=generator,
+                        output_type="pil",
+                    ).images
+
+                    # denormalize the images and save to tensorboard
+                    # images_processed = (images * 255).round().astype("uint8")
+
+                    # save a few images and condition image batch to  wandb
+
+                    if args.logger == "wandb":
+                     
+
+                        table = wandb.Table(columns=['Low-Res Input', 'High-Res Output', 'Ground Truth'])
+
+                        for low_res_image, high_res_output, ground_truth in zip(condition_image_batch, images, ground_truth_batch):
+                            low_res_image = convert_to_pillow(low_res_image.squeeze(0))
+                    
+                            ground_truth = convert_to_pillow(ground_truth.squeeze(0))
+                            table.add_data(wandb.Image(low_res_image), wandb.Image(high_res_output), wandb.Image(ground_truth))
+                            
+
+                        wandb_run.log({"Table" : table})
+
+
+            # if epoch % args.save_model_epochs == 0 or epoch == args.num_epochs - 1:
+            #     # save the model
+            #     pipeline.save_pretrained(args.output_dir)
+                # if args.push_to_hub:
+                #     repo.push_to_hub(commit_message=f"Epoch {epoch}", blocking=False)
 
     accelerator.end_training()
 
